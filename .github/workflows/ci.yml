@@ -16,6 +16,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Validate deploy scripts
+        run: bash -n deploy/*.sh
+      - name: Validate Docker Compose
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
       - run: npm install --no-audit --no-fund
       - run: npx prisma generate
       - run: npm run build
