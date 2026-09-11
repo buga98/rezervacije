@@ -1,0 +1,30 @@
+name: Unpack initial source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - source.tar.xz
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack production source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/rezervacije-source
+          mkdir -p /tmp/rezervacije-source
+          tar -xJf source.tar.xz -C /tmp/rezervacije-source
+          cp -a /tmp/rezervacije-source/lineaplus-rezervacije/. .
+          rm -f source.tar.xz .github/workflows/unpack-source.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: initial multi-tenant booking platform"
+          git push origin main
