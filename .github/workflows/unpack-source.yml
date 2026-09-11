@@ -3,6 +3,8 @@ name: Unpack initial source
 on:
   push:
     branches: [main]
+    paths:
+      - '.bootstrap/**'
 
 permissions:
   contents: write
@@ -23,7 +25,8 @@ jobs:
           mkdir -p /tmp/rezervacije-source
           tar -xJf /tmp/source.tar.xz -C /tmp/rezervacije-source
           cp -a /tmp/rezervacije-source/lineaplus-rezervacije/. .
-          rm -rf .bootstrap source.tar.xz .github/workflows/unpack-source.yml
+          rm -rf .bootstrap source.tar.xz
+          rm -f .github/workflows/ci.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
