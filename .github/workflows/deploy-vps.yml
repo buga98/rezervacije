@@ -1,7 +1,9 @@
 name: Deploy VPS
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -20,12 +22,10 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Validate deployment secrets
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -35,13 +35,6 @@ jobs:
           test -n "$VPS_HOST" || { echo "Missing VPS_HOST"; exit 1; }
           test -n "$VPS_USER" || { echo "Missing VPS_USER"; exit 1; }
           test -n "$VPS_SSH_KEY" || { echo "Missing VPS_SSH_KEY"; exit 1; }
-
-      - name: Build production image on GitHub
-        run: |
-          set -euo pipefail
-          docker build -t lineaplus-rezervacije:latest .
-          docker save lineaplus-rezervacije:latest | gzip -1 > /tmp/rezervacije-image.tar.gz
-          ls -lh /tmp/rezervacije-image.tar.gz
 
       - name: Configure SSH
         env:
@@ -56,20 +49,22 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
           ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'echo "SSH OK: $(hostname)"'
 
-      - name: Transfer image
+      - name: Deploy on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
-        run: |
-          scp /tmp/rezervacije-image.tar.gz "$VPS_USER@$VPS_HOST:/tmp/rezervacije-image.tar.gz"
-
-      - name: Bootstrap and deploy
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
+          EVENT_NAME: ${{ github.event_name }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.run_seed || false }}
         run: |
-          timeout 15m ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=3 "$VPS_USER@$VPS_HOST" "RUN_SEED='$RUN_SEED' bash -se" <<'REMOTE'
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ] && [ -n "$VERIFIED_SHA" ]; then
+            DEPLOY_REF="$VERIFIED_SHA"
+          else
+            DEPLOY_REF="main"
+          fi
+
+          timeout 20m ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=3 "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' RUN_SEED='$RUN_SEED' bash -se" <<'REMOTE'
             set -Eeuo pipefail
 
             APP_DIR=/opt/rezervacije
@@ -81,7 +76,7 @@ jobs:
             uid=$(id -u)
             gid=$(id -g)
 
-            echo '[rezervacije] Preparing application directory'
+            echo "[rezervacije] Deploying ref: $DEPLOY_REF"
             if [ ! -d "$APP_DIR" ]; then
               docker run --rm -v /opt:/host mariadb:11.4 sh -c "mkdir -p /host/rezervacije && chown $uid:$gid /host/rezervacije"
             fi
@@ -89,16 +84,21 @@ jobs:
             if [ -d "$APP_DIR/.git" ]; then
               cd "$APP_DIR"
               git fetch origin main
-              git reset --hard origin/main
+              if [ "$DEPLOY_REF" = "main" ]; then
+                git reset --hard origin/main
+              else
+                git fetch origin "$DEPLOY_REF"
+                git reset --hard "$DEPLOY_REF"
+              fi
               git clean -fd -e .env -e .initial-credentials
             else
               git clone --branch main "$REPO_URL" "$APP_DIR"
               cd "$APP_DIR"
+              if [ "$DEPLOY_REF" != "main" ]; then
+                git fetch origin "$DEPLOY_REF"
+                git reset --hard "$DEPLOY_REF"
+              fi
             fi
-
-            echo '[rezervacije] Loading prebuilt image'
-            gunzip -c /tmp/rezervacije-image.tar.gz | docker load
-            rm -f /tmp/rezervacije-image.tar.gz
 
             FIRST_INSTALL=false
             if [ ! -f .env ]; then
@@ -159,6 +159,9 @@ jobs:
               echo '[rezervacije] Existing .env preserved'
             fi
 
+            echo '[rezervacije] Building Docker image on VPS (cached)'
+            docker compose build --pull
+
             VAPID_CURRENT=$(grep -m1 '^VAPID_PUBLIC_KEY=' .env | cut -d= -f2- | tr -d '"' || true)
             if [ -z "$VAPID_CURRENT" ]; then
               echo '[rezervacije] Generating VAPID keys'
@@ -180,23 +183,44 @@ jobs:
             echo '[rezervacije] Starting app and notification worker'
             docker compose up -d --no-build --remove-orphans
 
-            echo '[rezervacije] Local health check'
+            echo '[rezervacije] Verifying app health'
+            HEALTHY=false
             for i in {1..40}; do
               if curl -fsS http://127.0.0.1:3700/api/health >/tmp/rezervacije-health.json; then
-                cat /tmp/rezervacije-health.json
-                echo
-                docker compose ps
-                if [ -f .initial-credentials ]; then
-                  echo 'INITIAL_CREDENTIALS_FILE=/opt/rezervacije/.initial-credentials'
-                fi
-                exit 0
+                HEALTHY=true
+                break
               fi
               sleep 3
             done
 
+            if [ "$HEALTHY" != true ]; then
+              docker compose ps
+              docker compose logs --tail=120 app worker
+              exit 1
+            fi
+
+            cat /tmp/rezervacije-health.json
+            echo
+            sleep 8
+
+            APP_CID=$(docker compose ps -q app)
+            WORKER_CID=$(docker compose ps -q worker)
+            test -n "$APP_CID" || { echo 'App container missing'; exit 1; }
+            test -n "$WORKER_CID" || { echo 'Worker container missing'; exit 1; }
+
+            WORKER_RUNNING=$(docker inspect -f '{{.State.Running}}' "$WORKER_CID")
+            WORKER_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$WORKER_CID")
+            echo "worker_running=$WORKER_RUNNING worker_restarts=$WORKER_RESTARTS"
+            if [ "$WORKER_RUNNING" != true ] || [ "$WORKER_RESTARTS" -gt 0 ]; then
+              docker compose logs --tail=120 worker
+              exit 1
+            fi
+
             docker compose ps
-            docker compose logs --tail=160 app worker
-            exit 1
+            docker compose logs --tail=20 worker
+            if [ -f .initial-credentials ]; then
+              echo 'INITIAL_CREDENTIALS_FILE=/opt/rezervacije/.initial-credentials'
+            fi
           REMOTE
 
       - name: Public endpoint check
