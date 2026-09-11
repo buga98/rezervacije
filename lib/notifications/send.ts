@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
 import webpush from "web-push";
-import { prisma } from "@/lib/db";
+import { prisma } from "../db";
 
 function mailer() {
   if (!process.env.SMTP_HOST) return null;
