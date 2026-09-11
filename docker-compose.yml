@@ -3,10 +3,7 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "127.0.0.1:3700:3700"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3700/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -17,9 +14,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    network_mode: host
     command: ["npm", "run", "worker"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       app:
         condition: service_healthy
