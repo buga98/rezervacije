@@ -15,10 +15,14 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: rezervacije-production
   cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/buga98/rezervacije
 
 jobs:
   deploy:
@@ -26,6 +30,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Resolve deploy ref
+        id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ] && [ -n "$VERIFIED_SHA" ]; then
+            DEPLOY_REF="$VERIFIED_SHA"
+          else
+            DEPLOY_REF="main"
+          fi
+          echo "deploy_ref=$DEPLOY_REF" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${VERIFIED_SHA:-$CURRENT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout verified source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.deploy_ref }}
+
       - name: Validate deployment secrets
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -35,6 +60,24 @@ jobs:
           test -n "$VPS_HOST" || { echo "Missing VPS_HOST"; exit 1; }
           test -n "$VPS_USER" || { echo "Missing VPS_USER"; exit 1; }
           test -n "$VPS_SSH_KEY" || { echo "Missing VPS_SSH_KEY"; exit 1; }
+
+      - name: Build production image on GitHub
+        env:
+          IMAGE_TAG: ${{ steps.ref.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
+
+      - name: Publish image to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE_TAG: ${{ steps.ref.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:latest"
+          docker logout ghcr.io
 
       - name: Configure SSH
         env:
@@ -49,26 +92,24 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
           ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'echo "SSH OK: $(hostname)"'
 
-      - name: Deploy on VPS
+      - name: Deploy pulled image on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          EVENT_NAME: ${{ github.event_name }}
-          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEPLOY_REF: ${{ steps.ref.outputs.deploy_ref }}
+          IMAGE_TAG: ${{ steps.ref.outputs.image_tag }}
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
           RUN_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.run_seed || false }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_run" ] && [ -n "$VERIFIED_SHA" ]; then
-            DEPLOY_REF="$VERIFIED_SHA"
-          else
-            DEPLOY_REF="main"
-          fi
-
-          timeout 20m ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=3 "$VPS_USER@$VPS_HOST" "DEPLOY_REF='$DEPLOY_REF' RUN_SEED='$RUN_SEED' bash -se" <<'REMOTE'
+          timeout 12m ssh -o ServerAliveInterval=20 -o ServerAliveCountMax=3 "$VPS_USER@$VPS_HOST" \
+            "DEPLOY_REF='$DEPLOY_REF' IMAGE_TAG='$IMAGE_TAG' RUN_SEED='$RUN_SEED' GHCR_USER='$GHCR_USER' GHCR_TOKEN='$GHCR_TOKEN' bash -se" <<'REMOTE'
             set -Eeuo pipefail
 
             APP_DIR=/opt/rezervacije
             REPO_URL=https://github.com/buga98/rezervacije.git
+            IMAGE_NAME=ghcr.io/buga98/rezervacije
             DOMAIN=rezervacije.lineaplusdev.com
             DB_NAME=rezervacije
             DB_USER=rezervacije_user
@@ -77,6 +118,8 @@ jobs:
             gid=$(id -g)
 
             echo "[rezervacije] Deploying ref: $DEPLOY_REF"
+            echo "[rezervacije] Using image: $IMAGE_NAME:$IMAGE_TAG"
+
             if [ ! -d "$APP_DIR" ]; then
               docker run --rm -v /opt:/host mariadb:11.4 sh -c "mkdir -p /host/rezervacije && chown $uid:$gid /host/rezervacije"
             fi
@@ -159,8 +202,11 @@ jobs:
               echo '[rezervacije] Existing .env preserved'
             fi
 
-            echo '[rezervacije] Building Docker image on VPS (cached)'
-            docker compose build --pull
+            echo '[rezervacije] Pulling prebuilt image from GHCR'
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$IMAGE_NAME:$IMAGE_TAG"
+            docker tag "$IMAGE_NAME:$IMAGE_TAG" lineaplus-rezervacije:latest
+            docker logout ghcr.io
 
             VAPID_CURRENT=$(grep -m1 '^VAPID_PUBLIC_KEY=' .env | cut -d= -f2- | tr -d '"' || true)
             if [ -z "$VAPID_CURRENT" ]; then
@@ -181,7 +227,7 @@ jobs:
             fi
 
             echo '[rezervacije] Starting app and notification worker'
-            docker compose up -d --no-build --remove-orphans
+            docker compose up -d --no-build --force-recreate --remove-orphans
 
             echo '[rezervacije] Verifying app health'
             HEALTHY=false
