@@ -235,11 +235,11 @@ jobs:
             fi
 
             echo '[rezervacije] Applying database migrations'
-            docker compose run --rm --no-deps worker ./node_modules/.bin/prisma migrate deploy
+            docker compose run --rm --no-deps worker ./node_modules/.bin/prisma migrate deploy </dev/null
 
             if [ "$FIRST_INSTALL" = true ] || [ "${RUN_SEED:-false}" = true ]; then
               echo '[rezervacije] Seeding SuperAdmin and demo salon'
-              docker compose run --rm --no-deps worker ./node_modules/.bin/tsx prisma/seed.ts
+              docker compose run --rm --no-deps worker ./node_modules/.bin/tsx prisma/seed.ts </dev/null
             fi
 
             echo '[rezervacije] Starting app and notification worker'
