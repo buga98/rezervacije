@@ -7,14 +7,55 @@ datasource db {
   provider = "mysql"
 }
 
-enum UserRole { SUPERADMIN OWNER MANAGER STAFF }
-enum AppointmentStatus { PENDING CONFIRMED COMPLETED CANCELLED NO_SHOW }
-enum OverrideType { WORKING BLOCKED }
-enum NotificationChannel { EMAIL PUSH SMS WHATSAPP }
-enum NotificationStatus { PENDING SENT FAILED SKIPPED }
-enum PaymentStatus { REQUIRES_PAYMENT PAID REFUNDED FAILED CANCELLED }
+enum UserRole {
+  SUPERADMIN
+  OWNER
+  MANAGER
+  STAFF
+}
 
-enum TenantStatus { TRIAL ACTIVE PAST_DUE SUSPENDED CANCELLED }
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum OverrideType {
+  WORKING
+  BLOCKED
+}
+
+enum NotificationChannel {
+  EMAIL
+  PUSH
+  SMS
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum PaymentStatus {
+  REQUIRES_PAYMENT
+  PAID
+  REFUNDED
+  FAILED
+  CANCELLED
+}
+
+enum TenantStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
 
 model Tenant {
   id                    String   @id @default(cuid())
@@ -36,12 +77,12 @@ model Tenant {
   users                 User[]
   categories            ServiceCategory[]
   services              Service[]
-  staff                  StaffProfile[]
-  customers              Customer[]
-  appointments           Appointment[]
-  workingHours           WorkingHour[]
-  overrides              ScheduleOverride[]
-  subscriptions          PushSubscription[]
+  staff                 StaffProfile[]
+  customers             Customer[]
+  appointments          Appointment[]
+  workingHours          WorkingHour[]
+  overrides             ScheduleOverride[]
+  subscriptions         PushSubscription[]
   notificationJobs      NotificationJob[]
 }
 
