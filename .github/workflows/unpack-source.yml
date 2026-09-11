@@ -3,8 +3,6 @@ name: Unpack initial source
 on:
   push:
     branches: [main]
-    paths:
-      - source.tar.xz
 
 permissions:
   contents: write
@@ -18,6 +16,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -f source.tar.xz
           rm -rf /tmp/rezervacije-source
           mkdir -p /tmp/rezervacije-source
           tar -xJf source.tar.xz -C /tmp/rezervacije-source
