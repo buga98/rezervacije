@@ -10,11 +10,22 @@ async function tick() {
     orderBy: { sendAt: "asc" },
     take: 50,
   });
-  for (const job of jobs) await sendNotificationJob(job.id);
+
+  for (const job of jobs) {
+    await sendNotificationJob(job.id);
+  }
 }
 
-console.log("[worker] notification worker started");
-for (;;) {
-  await tick().catch(e => console.error("[worker]", e));
-  await sleep(15_000);
+async function main() {
+  console.log("[worker] notification worker started");
+
+  for (;;) {
+    await tick().catch((error) => console.error("[worker]", error));
+    await sleep(15_000);
+  }
 }
+
+main().catch((error) => {
+  console.error("[worker] fatal", error);
+  process.exit(1);
+});
