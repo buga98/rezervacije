@@ -1,6 +1,8 @@
 name: Deploy VPS
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       run_seed:
@@ -19,7 +21,11 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Validate deployment secrets
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -30,56 +36,170 @@ jobs:
           test -n "$VPS_USER" || { echo "Missing VPS_USER"; exit 1; }
           test -n "$VPS_SSH_KEY" || { echo "Missing VPS_SSH_KEY"; exit 1; }
 
+      - name: Build production image on GitHub
+        run: |
+          set -euo pipefail
+          docker build -t lineaplus-rezervacije:latest .
+          docker save lineaplus-rezervacije:latest | gzip -1 > /tmp/rezervacije-image.tar.gz
+          ls -lh /tmp/rezervacije-image.tar.gz
+
       - name: Configure SSH
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
           set -euo pipefail
-          PORT="${VPS_PORT:-22}"
           install -m 700 -d ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'echo "SSH OK: $(hostname)"'
 
-      - name: Deploy application
+      - name: Transfer image
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          RUN_SEED: ${{ inputs.run_seed }}
         run: |
-          set -euo pipefail
-          PORT="${VPS_PORT:-22}"
-          ssh -p "$PORT" "$VPS_USER@$VPS_HOST" "RUN_SEED='$RUN_SEED' bash -se" <<'REMOTE'
-          set -Eeuo pipefail
-          APP_DIR=/opt/rezervacije
-          test -d "$APP_DIR/.git" || { echo "First install nije izvršen u $APP_DIR"; exit 1; }
-          test -f "$APP_DIR/.env" || { echo "Nedostaje $APP_DIR/.env"; exit 1; }
+          scp /tmp/rezervacije-image.tar.gz "$VPS_USER@$VPS_HOST:/tmp/rezervacije-image.tar.gz"
 
-          cd "$APP_DIR"
-          git fetch origin main
-          git reset --hard origin/main
+      - name: Bootstrap and deploy
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          RUN_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.run_seed || false }}
+        run: |
+          ssh "$VPS_USER@$VPS_HOST" "RUN_SEED='$RUN_SEED' bash -se" <<'REMOTE'
+            set -Eeuo pipefail
 
-          docker compose build --pull
-          docker compose run --rm --no-deps app npx prisma migrate deploy
-          if [[ "${RUN_SEED:-false}" == "true" ]]; then
-            docker compose run --rm --no-deps app npm run db:seed
-          fi
-          docker compose up -d --remove-orphans
+            APP_DIR=/opt/rezervacije
+            REPO_URL=https://github.com/buga98/rezervacije.git
+            DOMAIN=rezervacije.lineaplusdev.com
+            DB_NAME=rezervacije
+            DB_USER=rezervacije_user
+            SUPERADMIN_EMAIL=admin@lineaplusdev.com
+            uid=$(id -u)
+            gid=$(id -g)
 
-          for attempt in {1..30}; do
-            if curl -fsS http://127.0.0.1:3700/api/health; then
-              echo
-              echo "Deployment healthy"
-              docker compose ps
-              exit 0
+            echo '[rezervacije] Preparing application directory'
+            if [ ! -d "$APP_DIR" ]; then
+              docker run --rm -v /opt:/host mariadb:11.4 sh -c "mkdir -p /host/rezervacije && chown $uid:$gid /host/rezervacije"
             fi
-            sleep 2
-          done
 
-          docker compose ps
-          docker compose logs --tail=100 app
-          exit 1
+            if [ -d "$APP_DIR/.git" ]; then
+              cd "$APP_DIR"
+              git fetch origin main
+              git reset --hard origin/main
+              git clean -fd -e .env -e .initial-credentials
+            else
+              git clone --branch main "$REPO_URL" "$APP_DIR"
+              cd "$APP_DIR"
+            fi
+
+            echo '[rezervacije] Loading prebuilt image'
+            gunzip -c /tmp/rezervacije-image.tar.gz | docker load
+            rm -f /tmp/rezervacije-image.tar.gz
+
+            FIRST_INSTALL=false
+            if [ ! -f .env ]; then
+              FIRST_INSTALL=true
+              echo '[rezervacije] First install: creating MariaDB database and production environment'
+
+              DB_PASS=$(openssl rand -hex 24)
+              AUTH_SECRET=$(openssl rand -hex 48)
+              CRON_SECRET=$(openssl rand -hex 32)
+              SUPERADMIN_PASSWORD=$(openssl rand -hex 14)
+              DEMO_OWNER_PASSWORD=$(openssl rand -hex 14)
+
+              SQL="CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASS'; ALTER USER '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASS'; CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'127.0.0.1'; GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;"
+              docker run --rm -v /run/mysqld:/run/mysqld mariadb:11.4 mariadb --protocol=socket -S /run/mysqld/mysqld.sock -uroot -e "$SQL"
+
+              SMTP_HOST_VAL=$(grep -m1 '^SMTP_HOST=' /opt/sredito/.env 2>/dev/null | cut -d= -f2- || true)
+              SMTP_PORT_VAL=$(grep -m1 '^SMTP_PORT=' /opt/sredito/.env 2>/dev/null | cut -d= -f2- || true)
+              SMTP_SECURE_VAL=$(grep -m1 '^SMTP_SECURE=' /opt/sredito/.env 2>/dev/null | cut -d= -f2- || true)
+              SMTP_USER_VAL=$(grep -m1 '^SMTP_USER=' /opt/sredito/.env 2>/dev/null | cut -d= -f2- || true)
+              SMTP_PASS_VAL=$(grep -m1 '^SMTP_PASS=' /opt/sredito/.env 2>/dev/null | cut -d= -f2- || true)
+
+              {
+                printf '%s\n' 'NODE_ENV=production'
+                printf 'APP_URL=https://%s\n' "$DOMAIN"
+                printf 'DATABASE_URL=mysql://%s:%s@127.0.0.1:3306/%s\n' "$DB_USER" "$DB_PASS" "$DB_NAME"
+                printf '%s\n' 'DB_POOL_SIZE=10'
+                printf 'AUTH_SECRET=%s\n' "$AUTH_SECRET"
+                printf 'CRON_SECRET=%s\n' "$CRON_SECRET"
+                printf 'SUPERADMIN_EMAIL=%s\n' "$SUPERADMIN_EMAIL"
+                printf 'SUPERADMIN_PASSWORD=%s\n' "$SUPERADMIN_PASSWORD"
+                printf '%s\n' 'SEED_DEMO=true'
+                printf 'DEMO_OWNER_PASSWORD=%s\n' "$DEMO_OWNER_PASSWORD"
+                printf 'SMTP_HOST=%s\n' "$SMTP_HOST_VAL"
+                printf 'SMTP_PORT=%s\n' "${SMTP_PORT_VAL:-587}"
+                printf 'SMTP_SECURE=%s\n' "${SMTP_SECURE_VAL:-false}"
+                printf 'SMTP_USER=%s\n' "$SMTP_USER_VAL"
+                printf 'SMTP_PASS=%s\n' "$SMTP_PASS_VAL"
+                printf '%s\n' 'SMTP_FROM="Linea+ Rezervacije <noreply@lineaplusdev.com>"'
+                printf '%s\n' 'VAPID_PUBLIC_KEY='
+                printf '%s\n' 'VAPID_PRIVATE_KEY='
+                printf 'VAPID_SUBJECT=mailto:%s\n' "$SUPERADMIN_EMAIL"
+                printf '%s\n' 'STRIPE_SECRET_KEY='
+                printf '%s\n' 'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY='
+                printf '%s\n' 'TWILIO_ACCOUNT_SID='
+                printf '%s\n' 'TWILIO_AUTH_TOKEN='
+                printf '%s\n' 'TWILIO_SMS_FROM='
+                printf '%s\n' 'TWILIO_WHATSAPP_FROM='
+              } > .env
+
+              {
+                printf 'SuperAdmin email: %s\n' "$SUPERADMIN_EMAIL"
+                printf 'SuperAdmin password: %s\n' "$SUPERADMIN_PASSWORD"
+                printf '%s\n' 'Demo owner email: demo@lineaplusdev.com'
+                printf 'Demo owner password: %s\n' "$DEMO_OWNER_PASSWORD"
+              } > .initial-credentials
+              chmod 600 .env .initial-credentials
+            else
+              echo '[rezervacije] Existing .env preserved'
+            fi
+
+            VAPID_CURRENT=$(grep -m1 '^VAPID_PUBLIC_KEY=' .env | cut -d= -f2- | tr -d '"' || true)
+            if [ -z "$VAPID_CURRENT" ]; then
+              echo '[rezervacije] Generating VAPID keys'
+              mapfile -t VAPID_KEYS < <(docker run --rm lineaplus-rezervacije:latest node -e "const k=require('web-push').generateVAPIDKeys();console.log(k.publicKey);console.log(k.privateKey)")
+              VAPID_PUBLIC=${VAPID_KEYS[0]}
+              VAPID_PRIVATE=${VAPID_KEYS[1]}
+              sed -i "s|^VAPID_PUBLIC_KEY=.*|VAPID_PUBLIC_KEY=$VAPID_PUBLIC|" .env
+              sed -i "s|^VAPID_PRIVATE_KEY=.*|VAPID_PRIVATE_KEY=$VAPID_PRIVATE|" .env
+            fi
+
+            echo '[rezervacije] Applying database migrations'
+            docker compose run --rm --no-deps app npx prisma migrate deploy
+
+            if [ "$FIRST_INSTALL" = true ] || [ "${RUN_SEED:-false}" = true ]; then
+              echo '[rezervacije] Seeding SuperAdmin and demo salon'
+              docker compose run --rm --no-deps app npm run db:seed
+            fi
+
+            echo '[rezervacije] Starting app and notification worker'
+            docker compose up -d --no-build --remove-orphans
+
+            echo '[rezervacije] Local health check'
+            for i in {1..40}; do
+              if curl -fsS http://127.0.0.1:3700/api/health >/tmp/rezervacije-health.json; then
+                cat /tmp/rezervacije-health.json
+                echo
+                docker compose ps
+                if [ -f .initial-credentials ]; then
+                  echo 'INITIAL_CREDENTIALS_FILE=/opt/rezervacije/.initial-credentials'
+                fi
+                exit 0
+              fi
+              sleep 3
+            done
+
+            docker compose ps
+            docker compose logs --tail=160 app worker
+            exit 1
           REMOTE
+
+      - name: Public endpoint check
+        continue-on-error: true
+        run: |
+          curl -LfsS --max-time 15 https://rezervacije.lineaplusdev.com/api/health
