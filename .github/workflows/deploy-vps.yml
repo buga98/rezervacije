@@ -61,22 +61,30 @@ jobs:
           test -n "$VPS_USER" || { echo "Missing VPS_USER"; exit 1; }
           test -n "$VPS_SSH_KEY" || { echo "Missing VPS_SSH_KEY"; exit 1; }
 
-      - name: Build production image on GitHub
+      - name: Build slim production images on GitHub
         env:
           IMAGE_TAG: ${{ steps.ref.outputs.image_tag }}
         run: |
           set -euo pipefail
-          docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
+          docker build --target app \
+            -t "$IMAGE_NAME:app-$IMAGE_TAG" \
+            -t "$IMAGE_NAME:app-latest" .
+          docker build --target worker \
+            -t "$IMAGE_NAME:worker-$IMAGE_TAG" \
+            -t "$IMAGE_NAME:worker-latest" .
+          docker images "$IMAGE_NAME" --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 
-      - name: Publish image to GHCR
+      - name: Publish slim images to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
           IMAGE_TAG: ${{ steps.ref.outputs.image_tag }}
         run: |
           set -euo pipefail
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$IMAGE_NAME:$IMAGE_TAG"
-          docker push "$IMAGE_NAME:latest"
+          docker push "$IMAGE_NAME:app-$IMAGE_TAG"
+          docker push "$IMAGE_NAME:app-latest"
+          docker push "$IMAGE_NAME:worker-$IMAGE_TAG"
+          docker push "$IMAGE_NAME:worker-latest"
           docker logout ghcr.io
 
       - name: Configure SSH
@@ -92,7 +100,7 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
           ssh -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'echo "SSH OK: $(hostname)"'
 
-      - name: Deploy pulled image on VPS
+      - name: Deploy slim images on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -118,7 +126,7 @@ jobs:
             gid=$(id -g)
 
             echo "[rezervacije] Deploying ref: $DEPLOY_REF"
-            echo "[rezervacije] Using image: $IMAGE_NAME:$IMAGE_TAG"
+            echo "[rezervacije] Using slim app/worker images for: $IMAGE_TAG"
 
             if [ ! -d "$APP_DIR" ]; then
               docker run --rm -v /opt:/host mariadb:11.4 sh -c "mkdir -p /host/rezervacije && chown $uid:$gid /host/rezervacije"
@@ -202,16 +210,24 @@ jobs:
               echo '[rezervacije] Existing .env preserved'
             fi
 
-            echo '[rezervacije] Pulling prebuilt image from GHCR'
+            echo '[rezervacije] Clearing any stale deployment clients'
+            pkill -f 'docker compose build --pull' 2>/dev/null || true
+            pkill -f 'docker-buildx bake' 2>/dev/null || true
+            pkill -f 'docker pull ghcr.io/buga98/rezervacije' 2>/dev/null || true
+            sleep 2
+
+            echo '[rezervacije] Pulling slim images from GHCR'
             printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            docker pull "$IMAGE_NAME:$IMAGE_TAG"
-            docker tag "$IMAGE_NAME:$IMAGE_TAG" lineaplus-rezervacije:latest
+            docker pull "$IMAGE_NAME:app-$IMAGE_TAG"
+            docker pull "$IMAGE_NAME:worker-$IMAGE_TAG"
+            docker tag "$IMAGE_NAME:app-$IMAGE_TAG" lineaplus-rezervacije-app:latest
+            docker tag "$IMAGE_NAME:worker-$IMAGE_TAG" lineaplus-rezervacije-worker:latest
             docker logout ghcr.io
 
             VAPID_CURRENT=$(grep -m1 '^VAPID_PUBLIC_KEY=' .env | cut -d= -f2- | tr -d '"' || true)
             if [ -z "$VAPID_CURRENT" ]; then
               echo '[rezervacije] Generating VAPID keys'
-              mapfile -t VAPID_KEYS < <(docker run --rm lineaplus-rezervacije:latest node -e "const k=require('web-push').generateVAPIDKeys();console.log(k.publicKey);console.log(k.privateKey)")
+              mapfile -t VAPID_KEYS < <(docker run --rm lineaplus-rezervacije-worker:latest node -e "const k=require('web-push').generateVAPIDKeys();console.log(k.publicKey);console.log(k.privateKey)")
               VAPID_PUBLIC=${VAPID_KEYS[0]}
               VAPID_PRIVATE=${VAPID_KEYS[1]}
               sed -i "s|^VAPID_PUBLIC_KEY=.*|VAPID_PUBLIC_KEY=$VAPID_PUBLIC|" .env
@@ -219,11 +235,11 @@ jobs:
             fi
 
             echo '[rezervacije] Applying database migrations'
-            docker compose run --rm --no-deps app npx prisma migrate deploy
+            docker compose run --rm --no-deps worker ./node_modules/.bin/prisma migrate deploy
 
             if [ "$FIRST_INSTALL" = true ] || [ "${RUN_SEED:-false}" = true ]; then
               echo '[rezervacije] Seeding SuperAdmin and demo salon'
-              docker compose run --rm --no-deps app npm run db:seed
+              docker compose run --rm --no-deps worker ./node_modules/.bin/tsx prisma/seed.ts
             fi
 
             echo '[rezervacije] Starting app and notification worker'
